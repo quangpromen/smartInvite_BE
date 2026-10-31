@@ -1,0 +1,46 @@
+# Local .NET/NuGet state
+.dotnet-home/
+.nuget/
+.tmp/
+
+# Build outputs
+**/bin/
+**/obj/
+artifacts/
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+*.DotSettings.user
+
+# Local configuration and environment
+.env
+.env.*
+!.env.example
+appsettings.Local.json
+appsettings.*.Local.json
+
+# Logs
+*.log
+logs/
+
+# Tests and coverage
+TestResults/
+coverage/
+*.trx
+*.coverage
+*.coveragexml
+coverage.cobertura.xml
+
+# Local SQL Server files/backups
+*.mdf
+*.ldf
+*.ndf
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
