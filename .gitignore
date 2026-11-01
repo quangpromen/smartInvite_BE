@@ -10,17 +10,24 @@ artifacts/
 
 # IDE
 .vs/
+.vscode/
 .idea/
 *.user
 *.suo
 *.DotSettings.user
 
-# Local configuration and environment
+# Local configuration, secrets and certificates
 .env
 .env.*
 !.env.example
 appsettings.Local.json
 appsettings.*.Local.json
+launchSettings.Local.json
+secrets.json
+*.pfx
+*.p12
+*.pem
+*.key
 
 # Logs
 *.log
@@ -33,6 +40,9 @@ coverage/
 *.coverage
 *.coveragexml
 coverage.cobertura.xml
+
+# Reports
+report/
 
 # Local SQL Server files/backups
 *.mdf

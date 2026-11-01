@@ -1,11 +1,17 @@
 using Serilog;
+using SmartInvite.Api.Endpoints;
 using SmartInvite.Api.Extensions;
 using SmartInvite.Application;
 using SmartInvite.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Cấu hình Serilog từ configuration
+if (!builder.Environment.IsEnvironment("Testing"))
+{
+    builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
+    builder.Configuration.AddEnvironmentVariables();
+}
+
 builder.Host.UseSerilog((context, loggerConfig) =>
 {
     loggerConfig
@@ -13,44 +19,49 @@ builder.Host.UseSerilog((context, loggerConfig) =>
         .Enrich.FromLogContext();
 });
 
-// Cấu hình Clean Architecture layers
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(builder.Configuration);
 
-// Cấu hình Web API infrastructure
+builder.Services.Configure<RouteHandlerOptions>(options =>
+{
+    options.ThrowOnBadRequest = true;
+});
+
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
-builder.Services.AddOpenApi();
+builder.Services.AddApiOpenApi();
 builder.Services.AddApiHealthChecks();
+builder.Services.AddApiCors();
+builder.Services.AddApiRateLimiting();
+builder.Services.AddApiCsrfProtection();
 
 var app = builder.Build();
 
 app.UseSerilogRequestLogging();
 app.UseExceptionHandler();
 
-if (app.Environment.IsDevelopment())
-{
-    app.MapOpenApi();
-}
-
 if (!app.Environment.IsEnvironment("Testing"))
 {
     app.UseHttpsRedirection();
 }
 
-// Health check endpoints
-app.MapApiHealthEndpoints();
-
-// Endpoint nội bộ phục vụ kiểm thử exception handling trong môi trường Testing
-if (app.Environment.IsEnvironment("Testing"))
+if (app.Environment.IsDevelopment())
 {
-    app.MapGet("/internal/test-error", () =>
-    {
-        throw new InvalidOperationException("Test exception for error handling verification.");
-    }).ExcludeFromDescription();
+    app.UseApiOpenApi();
 }
+
+app.UseCors(CorsExtensions.PolicyName);
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseCsrfProtection();
+app.UseAntiforgery();
+
+app.MapApiHealthEndpoints();
+app.MapAuthEndpoints();
+app.MapAdminHostEndpoints();
+app.MapInternalTestingEndpoints(app.Environment);
 
 await app.RunAsync();
 
 public partial class Program;
-

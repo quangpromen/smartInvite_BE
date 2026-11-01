@@ -9,6 +9,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\SmartInvite.Domain\SmartInvite.Domain.csproj" />
     <ProjectReference Include="..\..\src\SmartInvite.Application\SmartInvite.Application.csproj" />
+    <ProjectReference Include="..\..\src\SmartInvite.Infrastructure\SmartInvite.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\SmartInvite.Api\SmartInvite.Api.csproj" />
   </ItemGroup>
 
   <ItemGroup>

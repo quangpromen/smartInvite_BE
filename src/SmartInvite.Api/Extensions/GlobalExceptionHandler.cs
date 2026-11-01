@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.EntityFrameworkCore;
 using SmartInvite.Api.Common;
+using SmartInvite.Domain.Common;
 
 namespace SmartInvite.Api.Extensions;
 
@@ -20,25 +23,66 @@ public sealed class GlobalExceptionHandler : IExceptionHandler
     {
         var traceId = Activity.Current?.Id ?? httpContext.TraceIdentifier;
 
-        _logger.LogError(
-            exception,
-            "Unhandled exception occurred. TraceId: {TraceId}",
-            traceId);
+        switch (exception)
+        {
+            case AntiforgeryValidationException:
+                _logger.LogWarning(
+                    "CSRF validation exception handled. Method: {Method}, Path: {Path}, TraceId: {TraceId}",
+                    httpContext.Request.Method,
+                    httpContext.Request.Path,
+                    traceId);
 
-        httpContext.Response.StatusCode = StatusCodes.Status500InternalServerError;
-        httpContext.Response.ContentType = "application/json";
+                await ApiResults.WriteErrorAsync(
+                    httpContext,
+                    StatusCodes.Status400BadRequest,
+                    ErrorCodes.CsrfValidationFailed,
+                    "Xác thực CSRF thất bại. Vui lòng lấy token mới và thử lại.",
+                    cancellationToken: cancellationToken);
+                return true;
 
-        var errorDetails = new ErrorDetails(
-            Code: "INTERNAL_ERROR",
-            Message: "Đã xảy ra lỗi không mong muốn",
-            Fields: new Dictionary<string, string[]>(),
-            TraceId: traceId);
+            case BadHttpRequestException:
+                _logger.LogWarning(
+                    "Invalid HTTP request payload rejected. Method: {Method}, Path: {Path}, TraceId: {TraceId}",
+                    httpContext.Request.Method,
+                    httpContext.Request.Path,
+                    traceId);
 
-        var response = new ErrorEnvelope(errorDetails);
+                await ApiResults.WriteErrorAsync(
+                    httpContext,
+                    StatusCodes.Status400BadRequest,
+                    ErrorCodes.ValidationError,
+                    "Định dạng dữ liệu yêu cầu không hợp lệ.",
+                    cancellationToken: cancellationToken);
+                return true;
 
-        await httpContext.Response.WriteAsJsonAsync(response, cancellationToken);
+            case DbUpdateConcurrencyException:
+                _logger.LogWarning(
+                    "Database concurrency conflict handled. Method: {Method}, Path: {Path}, TraceId: {TraceId}",
+                    httpContext.Request.Method,
+                    httpContext.Request.Path,
+                    traceId);
 
-        return true;
+                await ApiResults.WriteErrorAsync(
+                    httpContext,
+                    StatusCodes.Status409Conflict,
+                    ErrorCodes.ConcurrencyConflict,
+                    "Dữ liệu đã bị thay đổi đồng thời. Vui lòng tải lại và thử lại.",
+                    cancellationToken: cancellationToken);
+                return true;
+
+            default:
+                _logger.LogError(
+                    exception,
+                    "Unhandled exception occurred. TraceId: {TraceId}",
+                    traceId);
+
+                await ApiResults.WriteErrorAsync(
+                    httpContext,
+                    StatusCodes.Status500InternalServerError,
+                    ErrorCodes.InternalError,
+                    "Đã xảy ra lỗi không mong muốn",
+                    cancellationToken: cancellationToken);
+                return true;
+        }
     }
 }
-
