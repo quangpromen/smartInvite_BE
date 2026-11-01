@@ -52,6 +52,9 @@ public class SwaggerOpenApiIntegrationTests : IClassFixture<CustomWebApplication
         Assert.Contains("JWT Bearer", description, StringComparison.Ordinal);
         Assert.DoesNotContain("__Host-SmartInvite.Auth", rawJson, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("SmartInviteCookie", rawJson, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Path=/api/auth", rawJson, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("__Host-SmartInvite.Refresh", rawJson, StringComparison.Ordinal);
+        Assert.Contains("Path=/", rawJson, StringComparison.Ordinal);
 
         await using var devFactory = CreateFactoryForEnvironment("Development");
         using var client = devFactory.CreateClient(new WebApplicationFactoryClientOptions

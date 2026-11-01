@@ -137,12 +137,38 @@ public sealed class TestSessionClient : IDisposable
             var cookieName = nameValue[..eqIndex];
             var cookieValue = nameValue[(eqIndex + 1)..];
             var cookiePath = "/";
+            var hasExplicitPath = false;
+            var hasSecure = false;
+            var hasDomain = false;
 
             foreach (var attr in segments.Skip(1))
             {
                 if (attr.StartsWith("path=", StringComparison.OrdinalIgnoreCase))
                 {
                     cookiePath = attr["path=".Length..];
+                    hasExplicitPath = true;
+                }
+                else if (attr.Equals("secure", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasSecure = true;
+                }
+                else if (attr.StartsWith("domain=", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasDomain = true;
+                }
+            }
+
+            if (cookieName.StartsWith("__Host-", StringComparison.Ordinal))
+            {
+                var isHttpsOrigin = string.Equals(
+                    response.RequestMessage?.RequestUri?.Scheme,
+                    Uri.UriSchemeHttps,
+                    StringComparison.OrdinalIgnoreCase);
+
+                if (!isHttpsOrigin || !hasSecure || hasDomain || !hasExplicitPath || cookiePath != "/")
+                {
+                    throw new InvalidOperationException(
+                        $"Trình duyệt từ chối cookie tiền tố '__Host-' không hợp lệ '{cookieName}' (Https={isHttpsOrigin}, Secure={hasSecure}, HasDomain={hasDomain}, ExplicitPath={hasExplicitPath}, Path='{cookiePath}').");
                 }
             }
 

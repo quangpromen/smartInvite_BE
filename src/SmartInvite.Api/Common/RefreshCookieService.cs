@@ -4,26 +4,7 @@ namespace SmartInvite.Api.Common;
 
 public static class RefreshCookieService
 {
-    public static CookieOptions BuildAppendOptions(DateTimeOffset utcNow, DateTimeOffset expiresAtUtc)
-    {
-        var maxAge = expiresAtUtc > utcNow
-            ? expiresAtUtc - utcNow
-            : TimeSpan.Zero;
-
-        return new CookieOptions
-        {
-            HttpOnly = true,
-            Secure = true,
-            SameSite = SameSiteMode.Lax,
-            Path = SecurityCookieConstants.RefreshCookiePath,
-            Domain = null,
-            MaxAge = maxAge,
-            Expires = expiresAtUtc,
-            IsEssential = true
-        };
-    }
-
-    public static CookieOptions BuildDeleteOptions() =>
+    private static CookieOptions CreateBaseHostCookieOptions() =>
         new()
         {
             HttpOnly = true,
@@ -33,6 +14,21 @@ public static class RefreshCookieService
             Domain = null,
             IsEssential = true
         };
+
+    public static CookieOptions BuildAppendOptions(DateTimeOffset utcNow, DateTimeOffset expiresAtUtc)
+    {
+        var maxAge = expiresAtUtc > utcNow
+            ? expiresAtUtc - utcNow
+            : TimeSpan.Zero;
+
+        var options = CreateBaseHostCookieOptions();
+        options.MaxAge = maxAge;
+        options.Expires = expiresAtUtc;
+        return options;
+    }
+
+    public static CookieOptions BuildDeleteOptions() =>
+        CreateBaseHostCookieOptions();
 
     public static string? ReadRefreshCookie(HttpContext httpContext)
     {

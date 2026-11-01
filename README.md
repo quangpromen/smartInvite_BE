@@ -14,7 +14,7 @@ Backend API cho nền tảng thiệp cưới và thiệp sự kiện số SmartI
   - Hai vai trò hệ thống: `ADMIN` và `HOST`.
 - **Cơ chế Xác thực JWT Bearer + Refresh Cookie & Khóa tài khoản:**
   - **Access Token:** JWT Bearer ngắn hạn (`15 phút` mặc định, ký `HS256` qua `Jwt__SigningKey`), trả trong JSON response, gửi qua header `Authorization: Bearer <accessToken>`, chứa claim `sst` (`SHA-256` của `SecurityStamp`) để kiểm tra thu hồi tức thời và trạng thái Identity Lockout trên từng request xác thực.
-  - **Refresh Token:** Chuỗi ngẫu nhiên mật mã (`64` random bytes `Base64Url`, thời hạn `7 ngày` mặc định), chỉ gửi qua cookie `HttpOnly` `Secure` `__Host-SmartInvite.Refresh` (`SameSite=Lax`, `Path=/api/auth`, `Domain=null`), chỉ lưu băm `SHA-256` hex trong bảng `RefreshTokens` trên SQL Server, hỗ trợ **rotation**, kiểm soát đồng thời nguyên tử và **reuse detection** thu hồi toàn bộ `FamilyId`.
+  - **Refresh Token:** Chuỗi ngẫu nhiên mật mã (`64` random bytes `Base64Url`, thời hạn `7 ngày` mặc định), chỉ gửi qua cookie `HttpOnly` `Secure` `__Host-SmartInvite.Refresh` (`SameSite=Lax`, `Path=/`, `Domain=null` tuân thủ chuẩn tiền tố `__Host-` của trình duyệt), chỉ lưu băm `SHA-256` hex trong bảng `RefreshTokens` trên SQL Server, hỗ trợ **rotation**, kiểm soát đồng thời nguyên tử và **reuse detection** thu hồi toàn bộ `FamilyId`.
   - **Lockout & Revocation:** Khóa tạm thời tự động khi nhập sai mật khẩu (`5 lần / 15 phút`) và khóa/mở khóa chủ động bởi `ADMIN` (`POST /api/admin/hosts/{hostId}/lock`, `POST /api/admin/hosts/{hostId}/unlock`) kết hợp xoay `SecurityStamp` (và thu hồi refresh token khi lock) làm JWT cũ mất hiệu lực ngay lập tức và không tự hoạt động lại sau khi unlock.
   - **CSRF theo metadata:** Bắt buộc cookie `__Host-SmartInvite.Antiforgery` + header `X-CSRF-TOKEN` trên các endpoint thao tác qua cookie (`POST /api/auth/login`, `POST /api/auth/refresh`, `POST /api/auth/logout`); các API dùng thuần `Authorization: Bearer` không yêu cầu CSRF.
   - **CORS & Rate Limiting:** Danh sách trắng origin (cấm wildcard `*`, cho phép `Authorization` và `X-CSRF-TOKEN`) cùng giới hạn tốc độ chống brute-force/flood trên `/api/auth/login` (`5 requests / 15 phút`) và `/api/auth/refresh` (`15 requests / 5 phút`).
@@ -55,9 +55,9 @@ Chiều phụ thuộc bắt buộc: `Domain` ← `Application` ← `Infrastructu
   - Mặc định `15 phút` (`Jwt:AccessTokenMinutes = 15`), `Issuer = SmartInvite.Api`, `Audience = SmartInvite.Web`, `ClockSkew = 30s`.
   - Không lưu trong cookie, không lưu trong database, không ghi ra log.
 - **Refresh Cookie (`__Host-SmartInvite.Refresh`):**
-  - `HttpOnly=true`, `Secure=Always`, `SameSite=Lax`, `Path=/api/auth`, `Domain=null`, thời hạn mặc định `7 ngày` (`Jwt:RefreshTokenDays = 7`).
+  - `HttpOnly=true`, `Secure=Always`, `SameSite=Lax`, `Path=/`, `Domain=null` (đáp ứng quy tắc tiền tố `__Host-` của trình duyệt cho cả thao tác ghi và xóa cookie), thời hạn mặc định `7 ngày` (`Jwt:RefreshTokenDays = 7`).
   - Không trả refresh token trong JSON response; database chỉ lưu băm `SHA-256` hex (`TokenHash`).
-  - Mỗi lần gọi `POST /api/auth/refresh` thành công sẽ rotate sang refresh token mới trong cùng `FamilyId`; nếu một token cũ đã rotate/revoke bị gửi lại, toàn bộ `FamilyId` bị thu hồi ngay lập tức.
+  - Mỗi lần gọi `POST /api/auth/refresh` thành công sẽ rotate nguyên tử sang refresh token mới trong cùng `FamilyId`. Request đồng thời bị thua race trong grace window nội bộ rất ngắn (`2 giây`, khi token thay thế vẫn là lá active chưa xoay vòng) bị từ chối `401` mà không thu hồi `FamilyId`; nếu một token cũ bị dùng lại thực sự ngoài điều kiện lost-race (sau grace window, token đã bị revoke hoặc chuỗi đã xoay vòng tiếp), toàn bộ `FamilyId` bị thu hồi ngay lập tức.
 - **Identity Lockout & Admin Lock/Unlock:**
   - Nhập sai mật khẩu `5` lần liên tiếp sẽ tự động khóa tạm thời trong `15 phút`.
   - `POST /api/admin/hosts/{hostId}/lock`: bật khóa vĩnh viễn (`LockoutEnd = DateTimeOffset.MaxValue`), xoay `SecurityStamp` và thu hồi toàn bộ refresh token đang hoạt động của `HOST`.

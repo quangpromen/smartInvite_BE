@@ -33,7 +33,7 @@ public static class AuthEndpoints
             .WithSummary("Đăng nhập bằng email và mật khẩu SmartInvite, trả JWT Bearer và đặt refresh cookie (Anonymous, yêu cầu CSRF)")
             .WithDescription(
                 "Xác thực tài khoản ADMIN hoặc HOST bằng mật khẩu SmartInvite (không phải mật khẩu Google/Gmail), " +
-                "trả về JWT access token ngắn hạn trong JSON và đặt refresh token ngẫu nhiên vào cookie HttpOnly Secure __Host-SmartInvite.Refresh (Path=/api/auth). " +
+                "trả về JWT access token ngắn hạn trong JSON và đặt refresh token ngẫu nhiên vào cookie HttpOnly Secure __Host-SmartInvite.Refresh (Path=/). " +
                 "Yêu cầu header X-CSRF-TOKEN hợp lệ; giới hạn tốc độ 5 yêu cầu / 15 phút theo phân vùng IP.")
             .Produces<ApiEnvelope<LoginResponseDto>>(StatusCodes.Status200OK)
             .Produces<ErrorEnvelope>(StatusCodes.Status400BadRequest)

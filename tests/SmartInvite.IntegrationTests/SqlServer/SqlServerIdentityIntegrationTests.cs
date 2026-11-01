@@ -13,10 +13,12 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Tokens;
 using SmartInvite.Api.Common;
+using SmartInvite.Application.Abstractions;
 using SmartInvite.Application.AdminHosts;
 using SmartInvite.Application.Auth;
 using SmartInvite.Application.Security;
@@ -298,11 +300,8 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
         Assert.True(loginResp.Headers.TryGetValues("Set-Cookie", out var setCookies));
         var refreshSetCookie = Assert.Single(setCookies, c =>
             c.StartsWith($"{SecurityCookieConstants.RefreshCookieName}=", StringComparison.Ordinal));
-        Assert.Contains("httponly", refreshSetCookie, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("secure", refreshSetCookie, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("samesite=lax", refreshSetCookie, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("path=/api/auth", refreshSetCookie, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("domain=", refreshSetCookie, StringComparison.OrdinalIgnoreCase);
+        AssertValidHostRefreshSetCookieHeader(refreshSetCookie, expectDeleted: false);
+        Assert.Contains("max-age=604800", refreshSetCookie, StringComparison.OrdinalIgnoreCase);
 
         // Verify SQL Server stores ONLY SHA-256 hash and NEVER raw refresh token
         var expectedHash = TokenCryptoHelper.ComputeSha256Hex(rawRefreshToken);
@@ -328,9 +327,17 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
     }
 
     [SqlServerFact]
-    public async Task RefreshRotation_RotatesToken_RejectsSecondUse_AndRevokesEntireFamilyOnReuseDetection()
+    public async Task RefreshRotation_RotatesToken_RejectsTrueReuseAfterRotation_AndRevokesEntireFamily()
     {
-        await using var factory = CreateSqlServerFactory(enableBootstrap: true);
+        var clock = new ControllableDateTimeProvider(DateTimeOffset.UtcNow.AddMinutes(-2));
+        await using var factory = CreateSqlServerFactory(
+            enableBootstrap: true,
+            configureTestServices: services =>
+            {
+                services.RemoveAll<IDateTimeProvider>();
+                services.AddSingleton<IDateTimeProvider>(clock);
+            });
+
         var (hostSummary, hostSecret) = await CreateHostAsAdminAsync(factory);
 
         using var hostClient = await LoginSessionAsync(factory, hostSummary.Email, hostSecret);
@@ -339,7 +346,8 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
 
         var (csrf, _) = await hostClient.FetchCsrfTokenAsync();
 
-        // 1. Valid refresh rotates RT1 -> RT2 in the same FamilyId
+        // 1. Valid refresh rotates Token A (RT1) -> Token B (RT2) in the same FamilyId
+        clock.Advance(TimeSpan.FromSeconds(10));
         var refreshResp = await hostClient.SendAsync(
             HttpMethod.Post,
             "/api/auth/refresh",
@@ -369,7 +377,9 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
             Assert.Null(rt2.RevokedAt);
         }
 
-        // 2. Replaying rotated RT1 fails with generic 401 INVALID_REFRESH_TOKEN AND revokes entire Family (including active RT2!)
+        // 2. Advance past concurrent grace window to establish true reuse condition, then replay rotated Token A
+        clock.Advance(RefreshTokenService.DefaultConcurrentRotationGraceWindow + TimeSpan.FromSeconds(3));
+
         using var attackerClient = new TestSessionClient(factory, NextClientIp());
         var (attackerCsrf, _) = await attackerClient.FetchCsrfTokenAsync();
         attackerClient.SetCookie(SecurityCookieConstants.RefreshCookieName, firstRawRefresh, SecurityCookieConstants.RefreshCookiePath);
@@ -396,7 +406,7 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
         Assert.Equal(replayErr.Error.Code, unknownErr!.Error.Code);
         Assert.Equal(replayErr.Error.Message, unknownErr.Error.Message);
 
-        // 3. Legitimate client's RT2 is now ALSO rejected because reuse detection revoked the entire family!
+        // 3. Token B is now ALSO rejected because reuse detection revoked the entire family!
         var postReuseRefreshResp = await hostClient.SendAsync(
             HttpMethod.Post,
             "/api/auth/refresh",
@@ -413,19 +423,21 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
     }
 
     [SqlServerFact]
-    public async Task ConcurrentRefresh_WithSameRefreshToken_AllowsStrictlyOneSuccessAndRejectsCompetingRequest()
+    public async Task ConcurrentRefresh_WithSameRefreshToken_AllowsStrictlyOneSuccess_PreservesActiveFamily_AndWinnerCanRefreshAgain()
     {
         var barrier = new ConcurrentRefreshBarrierSeam();
         await using var factory = CreateSqlServerFactory(
             enableBootstrap: true,
             configureTestServices: services =>
             {
+                services.RemoveAll<IRefreshTokenExecutionSeam>();
                 services.AddSingleton<IRefreshTokenExecutionSeam>(barrier);
             });
 
         var (hostSummary, hostSecret) = await CreateHostAsAdminAsync(factory);
         using var initialClient = await LoginSessionAsync(factory, hostSummary.Email, hostSecret);
         var sharedRefreshToken = initialClient.Cookies[SecurityCookieConstants.RefreshCookieName];
+        var sharedTokenHash = TokenCryptoHelper.ComputeSha256Hex(sharedRefreshToken);
 
         using var concurrentClientA = new TestSessionClient(factory, NextClientIp());
         using var concurrentClientB = new TestSessionClient(factory, NextClientIp());
@@ -443,11 +455,118 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
 
         var responses = await Task.WhenAll(taskA, taskB);
 
-        var successCount = responses.Count(r => r.StatusCode == HttpStatusCode.OK);
-        var unauthorizedCount = responses.Count(r => r.StatusCode == HttpStatusCode.Unauthorized);
+        var successResponses = responses.Where(r => r.StatusCode == HttpStatusCode.OK).ToArray();
+        var unauthorizedResponses = responses.Where(r => r.StatusCode == HttpStatusCode.Unauthorized).ToArray();
 
-        Assert.Equal(1, successCount);
-        Assert.Equal(1, unauthorizedCount);
+        var winnerResponse = Assert.Single(successResponses);
+        var loserResponse = Assert.Single(unauthorizedResponses);
+
+        var loserError = await loserResponse.Content.ReadFromJsonAsync<ErrorEnvelope>(JsonOptions);
+        Assert.Equal(ErrorCodes.InvalidRefreshToken, loserError!.Error.Code);
+        Assert.False(loserResponse.Headers.Contains("Set-Cookie"));
+
+        // Extract new refresh cookie directly from the 200 winner response and verify __Host- Path=/ attributes
+        var winnerNewRefreshCookie = ExtractRefreshCookieValueFromResponse(winnerResponse);
+        Assert.NotEqual(sharedRefreshToken, winnerNewRefreshCookie);
+
+        // Also verify staggered post-commit concurrent lost-race within grace window does NOT revoke winner's token
+        using var lateConcurrentLoser = new TestSessionClient(factory, NextClientIp());
+        var (lateCsrf, _) = await lateConcurrentLoser.FetchCsrfTokenAsync();
+        lateConcurrentLoser.SetCookie(SecurityCookieConstants.RefreshCookieName, sharedRefreshToken, SecurityCookieConstants.RefreshCookiePath);
+        var lateLoserResp = await lateConcurrentLoser.SendAsync(HttpMethod.Post, "/api/auth/refresh", csrfToken: lateCsrf);
+        Assert.Equal(HttpStatusCode.Unauthorized, lateLoserResp.StatusCode);
+
+        // Using winner's new refresh cookie to call /api/auth/refresh again MUST succeed (family remains active!)
+        using var winnerFollowUpClient = new TestSessionClient(factory, NextClientIp());
+        var (followUpCsrf, _) = await winnerFollowUpClient.FetchCsrfTokenAsync();
+        winnerFollowUpClient.SetCookie(SecurityCookieConstants.RefreshCookieName, winnerNewRefreshCookie, SecurityCookieConstants.RefreshCookiePath);
+
+        var secondRefreshResp = await winnerFollowUpClient.SendAsync(
+            HttpMethod.Post,
+            "/api/auth/refresh",
+            csrfToken: followUpCsrf);
+
+        Assert.Equal(HttpStatusCode.OK, secondRefreshResp.StatusCode);
+        var secondEnvelope = await secondRefreshResp.Content.ReadFromJsonAsync<ApiEnvelope<RefreshResponseDto>>(JsonOptions);
+        Assert.NotNull(secondEnvelope);
+        Assert.False(string.IsNullOrWhiteSpace(secondEnvelope.Data.AccessToken));
+
+        var thirdRefreshCookie = ExtractRefreshCookieValueFromResponse(secondRefreshResp);
+        Assert.NotEqual(winnerNewRefreshCookie, thirdRefreshCookie);
+        var thirdTokenHash = TokenCryptoHelper.ComputeSha256Hex(thirdRefreshCookie);
+
+        await using var verifyScope = factory.Services.CreateAsyncScope();
+        var db = verifyScope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        var initialEntity = await db.RefreshTokens.SingleAsync(t => t.TokenHash == sharedTokenHash);
+        var familyTokens = await db.RefreshTokens
+            .Where(t => t.FamilyId == initialEntity.FamilyId)
+            .ToListAsync();
+
+        Assert.Equal(3, familyTokens.Count);
+        Assert.All(familyTokens, t => Assert.Null(t.RevokedAt));
+
+        var latestActiveLeaf = Assert.Single(familyTokens, t => t.TokenHash == thirdTokenHash);
+        Assert.Null(latestActiveLeaf.RotatedAt);
+        Assert.Null(latestActiveLeaf.RevokedAt);
+    }
+
+    [SqlServerFact]
+    public async Task RefreshGraceWindowBoundary_BeforeAndAtBoundaryPreservesFamily_AndAfterBoundaryRevokesEntireFamily()
+    {
+        var clock = new ControllableDateTimeProvider(DateTimeOffset.UtcNow.AddMinutes(-2));
+        await using var factory = CreateSqlServerFactory(
+            enableBootstrap: true,
+            configureTestServices: services =>
+            {
+                services.RemoveAll<IDateTimeProvider>();
+                services.AddSingleton<IDateTimeProvider>(clock);
+            });
+
+        var (hostSummary, hostSecret) = await CreateHostAsAdminAsync(factory);
+        using var hostClient = await LoginSessionAsync(factory, hostSummary.Email, hostSecret);
+        var tokenA = hostClient.Cookies[SecurityCookieConstants.RefreshCookieName];
+        var (hostCsrf, _) = await hostClient.FetchCsrfTokenAsync();
+
+        // Rotate Token A -> Token B at T1
+        clock.Advance(TimeSpan.FromSeconds(10));
+        var rotateResp = await hostClient.SendAsync(HttpMethod.Post, "/api/auth/refresh", csrfToken: hostCsrf);
+        Assert.Equal(HttpStatusCode.OK, rotateResp.StatusCode);
+        var tokenB = hostClient.Cookies[SecurityCookieConstants.RefreshCookieName];
+        var tokenBHash = TokenCryptoHelper.ComputeSha256Hex(tokenB);
+
+        // 1. At exact upper boundary of grace window (+2000ms): competing replay returns 401 and family stays ACTIVE
+        clock.Advance(RefreshTokenService.DefaultConcurrentRotationGraceWindow);
+        using var boundaryClient = new TestSessionClient(factory, NextClientIp());
+        var (boundaryCsrf, _) = await boundaryClient.FetchCsrfTokenAsync();
+        boundaryClient.SetCookie(SecurityCookieConstants.RefreshCookieName, tokenA, SecurityCookieConstants.RefreshCookiePath);
+
+        var atBoundaryResp = await boundaryClient.SendAsync(HttpMethod.Post, "/api/auth/refresh", csrfToken: boundaryCsrf);
+        Assert.Equal(HttpStatusCode.Unauthorized, atBoundaryResp.StatusCode);
+
+        await using (var scopeBefore = factory.Services.CreateAsyncScope())
+        {
+            var db = scopeBefore.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            var rtB = await db.RefreshTokens.SingleAsync(t => t.TokenHash == tokenBHash);
+            Assert.Null(rtB.RevokedAt);
+            Assert.Null(rtB.RotatedAt);
+        }
+
+        // 2. 1ms past grace window (+2001ms total): replay is classified as true reuse and REVOKES entire family
+        clock.Advance(TimeSpan.FromMilliseconds(1));
+        var afterBoundaryResp = await boundaryClient.SendAsync(HttpMethod.Post, "/api/auth/refresh", csrfToken: boundaryCsrf);
+        Assert.Equal(HttpStatusCode.Unauthorized, afterBoundaryResp.StatusCode);
+
+        await using (var scopeAfter = factory.Services.CreateAsyncScope())
+        {
+            var db = scopeAfter.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            var rtB = await db.RefreshTokens.SingleAsync(t => t.TokenHash == tokenBHash);
+            Assert.NotNull(rtB.RevokedAt);
+            Assert.Equal(RefreshTokenRevokeReasons.ReuseDetected, rtB.RevokedReason);
+        }
+
+        // Token B is now rejected on refresh
+        var tokenBResp = await hostClient.SendAsync(HttpMethod.Post, "/api/auth/refresh", csrfToken: hostCsrf);
+        Assert.Equal(HttpStatusCode.Unauthorized, tokenBResp.StatusCode);
     }
 
     [SqlServerFact]
@@ -466,6 +585,10 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
         var logoutResp = await session1.SendAsync(HttpMethod.Post, "/api/auth/logout", csrfToken: csrf1);
         Assert.Equal(HttpStatusCode.OK, logoutResp.StatusCode);
         Assert.False(session1.Cookies.ContainsKey(SecurityCookieConstants.RefreshCookieName));
+        Assert.True(logoutResp.Headers.TryGetValues("Set-Cookie", out var logoutCookies));
+        var logoutDeleteCookie = Assert.Single(logoutCookies, c =>
+            c.StartsWith($"{SecurityCookieConstants.RefreshCookieName}=", StringComparison.Ordinal));
+        AssertValidHostRefreshSetCookieHeader(logoutDeleteCookie, expectDeleted: true);
 
         await using (var scope1 = factory.Services.CreateAsyncScope())
         {
@@ -1008,6 +1131,59 @@ public sealed class SqlServerIdentityIntegrationTests : IAsyncLifetime
             {
                 messages.Enqueue(formatter(state, exception));
             }
+        }
+    }
+
+    private static string ExtractRefreshCookieValueFromResponse(HttpResponseMessage response)
+    {
+        Assert.True(response.Headers.TryGetValues("Set-Cookie", out var setCookies));
+        var refreshSetCookie = Assert.Single(setCookies, c =>
+            c.StartsWith($"{SecurityCookieConstants.RefreshCookieName}=", StringComparison.Ordinal));
+        AssertValidHostRefreshSetCookieHeader(refreshSetCookie, expectDeleted: false);
+
+        var firstSegment = refreshSetCookie.Split(';', StringSplitOptions.TrimEntries)[0];
+        var eqIndex = firstSegment.IndexOf('=');
+        return firstSegment[(eqIndex + 1)..];
+    }
+
+    private static void AssertValidHostRefreshSetCookieHeader(string rawSetCookie, bool expectDeleted)
+    {
+        var segments = rawSetCookie.Split(';', StringSplitOptions.TrimEntries);
+        Assert.NotEmpty(segments);
+
+        var nameValue = segments[0];
+        var eqIndex = nameValue.IndexOf('=');
+        Assert.True(eqIndex > 0);
+        Assert.Equal(SecurityCookieConstants.RefreshCookieName, nameValue[..eqIndex]);
+
+        var cookieValue = nameValue[(eqIndex + 1)..];
+        if (expectDeleted)
+        {
+            Assert.Equal(string.Empty, cookieValue);
+        }
+        else
+        {
+            Assert.False(string.IsNullOrEmpty(cookieValue));
+        }
+
+        var attributes = segments.Skip(1).ToArray();
+        Assert.Contains(attributes, a => a.Equals("path=/", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(attributes, a => a.StartsWith("path=/api", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("httponly", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("secure", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("samesite=lax", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(attributes, a => a.StartsWith("domain=", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private sealed class ControllableDateTimeProvider(DateTimeOffset initialUtcNow) : IDateTimeProvider
+    {
+        private long _utcTicks = initialUtcNow.UtcTicks;
+
+        public DateTimeOffset UtcNow => new(Interlocked.Read(ref _utcTicks), TimeSpan.Zero);
+
+        public void Advance(TimeSpan delta)
+        {
+            Interlocked.Add(ref _utcTicks, delta.Ticks);
         }
     }
 }

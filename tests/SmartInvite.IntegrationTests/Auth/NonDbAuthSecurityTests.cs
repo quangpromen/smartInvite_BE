@@ -274,7 +274,7 @@ public class NonDbAuthSecurityTests : IClassFixture<CustomWebApplicationFactory>
             Assert.Equal(ErrorCodes.CsrfValidationFailed, invalidEnvelope.Error.Code);
         }
 
-        // Valid CSRF on idempotent logout without refresh cookie succeeds and sends delete Set-Cookie
+        // Valid CSRF on idempotent logout without refresh cookie succeeds and sends browser-compatible __Host- delete Set-Cookie
         using var validLogoutClient = new TestSessionClient(_factory, "198.51.100.32");
         var (validCsrf, _) = await validLogoutClient.FetchCsrfTokenAsync();
         var logoutResp = await validLogoutClient.SendAsync(HttpMethod.Post, "/api/auth/logout", csrfToken: validCsrf);
@@ -282,10 +282,7 @@ public class NonDbAuthSecurityTests : IClassFixture<CustomWebApplicationFactory>
         Assert.True(logoutResp.Headers.TryGetValues("Set-Cookie", out var logoutSetCookies));
         var deletedRefreshCookie = Assert.Single(logoutSetCookies, c =>
             c.StartsWith($"{SecurityCookieConstants.RefreshCookieName}=", StringComparison.Ordinal));
-        Assert.Contains("path=/api/auth", deletedRefreshCookie, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("httponly", deletedRefreshCookie, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("secure", deletedRefreshCookie, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("samesite=lax", deletedRefreshCookie, StringComparison.OrdinalIgnoreCase);
+        AssertValidHostRefreshCookieHeader(deletedRefreshCookie, expectDeleted: true);
     }
 
     [Fact]
@@ -366,6 +363,10 @@ public class NonDbAuthSecurityTests : IClassFixture<CustomWebApplicationFactory>
 
         var logoutAllResp = await adminClient.SendAsync(HttpMethod.Post, "/api/auth/logout-all");
         Assert.Equal(HttpStatusCode.OK, logoutAllResp.StatusCode);
+        Assert.True(logoutAllResp.Headers.TryGetValues("Set-Cookie", out var logoutAllCookies));
+        var logoutAllDeletedRefresh = Assert.Single(logoutAllCookies, c =>
+            c.StartsWith($"{SecurityCookieConstants.RefreshCookieName}=", StringComparison.Ordinal));
+        AssertValidHostRefreshCookieHeader(logoutAllDeletedRefresh, expectDeleted: true);
 
         // ADMIN calling HostOnly endpoint gets 403 Forbidden
         var adminCallingHostOnly = await adminClient.SendAsync(HttpMethod.Get, "/internal/test-host-only");
@@ -640,11 +641,7 @@ public class NonDbAuthSecurityTests : IClassFixture<CustomWebApplicationFactory>
         Assert.True(loginResp.Headers.TryGetValues("Set-Cookie", out var loginCookies));
         var refreshCookieHeader = Assert.Single(loginCookies, c =>
             c.StartsWith($"{SecurityCookieConstants.RefreshCookieName}=", StringComparison.Ordinal));
-        Assert.Contains("httponly", refreshCookieHeader, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("secure", refreshCookieHeader, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("samesite=lax", refreshCookieHeader, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("path=/api/auth", refreshCookieHeader, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("domain=", refreshCookieHeader, StringComparison.OrdinalIgnoreCase);
+        AssertValidHostRefreshCookieHeader(refreshCookieHeader, expectDeleted: false);
         Assert.DoesNotContain(loginCookies, c => c.StartsWith("__Host-SmartInvite.Auth=", StringComparison.OrdinalIgnoreCase));
 
         var capturedRawRefresh = client.Cookies[SecurityCookieConstants.RefreshCookieName];
@@ -652,9 +649,13 @@ public class NonDbAuthSecurityTests : IClassFixture<CustomWebApplicationFactory>
 
         client.AccessToken = loginData.GetProperty("accessToken").GetString();
 
-        // 2. Refresh returns only accessToken, tokenType, expiresInSeconds (no refreshToken in JSON)
+        // 2. Refresh returns only accessToken, tokenType, expiresInSeconds (no refreshToken in JSON) and rotates __Host- cookie with Path=/
         var refreshResp = await client.SendAsync(HttpMethod.Post, "/api/auth/refresh", csrfToken: csrf);
         Assert.Equal(HttpStatusCode.OK, refreshResp.StatusCode);
+        Assert.True(refreshResp.Headers.TryGetValues("Set-Cookie", out var refreshCookies));
+        var rotatedCookieHeader = Assert.Single(refreshCookies, c =>
+            c.StartsWith($"{SecurityCookieConstants.RefreshCookieName}=", StringComparison.Ordinal));
+        AssertValidHostRefreshCookieHeader(rotatedCookieHeader, expectDeleted: false);
         var refreshJson = await refreshResp.Content.ReadAsStringAsync();
         using var refreshDoc = JsonDocument.Parse(refreshJson);
         var refreshKeys = refreshDoc.RootElement.GetProperty("data").EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
@@ -788,6 +789,35 @@ public class NonDbAuthSecurityTests : IClassFixture<CustomWebApplicationFactory>
         Assert.NotNull(envelope);
         Assert.NotNull(envelope.Error);
         return envelope;
+    }
+
+    private static void AssertValidHostRefreshCookieHeader(string rawSetCookie, bool expectDeleted)
+    {
+        var segments = rawSetCookie.Split(';', StringSplitOptions.TrimEntries);
+        Assert.NotEmpty(segments);
+
+        var nameValue = segments[0];
+        var eqIndex = nameValue.IndexOf('=');
+        Assert.True(eqIndex > 0);
+        Assert.Equal(SecurityCookieConstants.RefreshCookieName, nameValue[..eqIndex]);
+
+        var value = nameValue[(eqIndex + 1)..];
+        if (expectDeleted)
+        {
+            Assert.Equal(string.Empty, value);
+        }
+        else
+        {
+            Assert.False(string.IsNullOrEmpty(value));
+        }
+
+        var attributes = segments.Skip(1).ToArray();
+        Assert.Contains(attributes, a => a.Equals("path=/", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(attributes, a => a.StartsWith("path=/api", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("httponly", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("secure", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("samesite=lax", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(attributes, a => a.StartsWith("domain=", StringComparison.OrdinalIgnoreCase));
     }
 
     private sealed class StubActiveTokenStateValidator : IAccessTokenStateValidator

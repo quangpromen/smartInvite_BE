@@ -303,10 +303,12 @@ public class JwtAndRefreshTokenUnitTests
     }
 
     [Fact]
-    public void RefreshCookieService_EnforcesHttpOnlySecureSameSiteLaxAndAuthPath_AndLegacyAuthCookieRemoved()
+    public void RefreshCookieService_EnforcesBrowserCompatibleHostPrefixRootPath_HttpOnlySecureSameSiteLax_AndMatchingDeleteOptions()
     {
         Assert.Equal("__Host-SmartInvite.Refresh", SecurityCookieConstants.RefreshCookieName);
-        Assert.Equal("/api/auth", SecurityCookieConstants.RefreshCookiePath);
+        Assert.StartsWith("__Host-", SecurityCookieConstants.RefreshCookieName, StringComparison.Ordinal);
+        Assert.Equal("/", SecurityCookieConstants.RefreshCookiePath);
+        Assert.NotEqual("/api/auth", SecurityCookieConstants.RefreshCookiePath);
         Assert.Equal("__Host-SmartInvite.Antiforgery", SecurityCookieConstants.AntiforgeryCookieName);
         Assert.Equal("/", SecurityCookieConstants.AntiforgeryCookiePath);
 
@@ -316,25 +318,196 @@ public class JwtAndRefreshTokenUnitTests
             .ToArray();
 
         Assert.DoesNotContain("__Host-SmartInvite.Auth", cookieConstantValues, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain("/api/auth", cookieConstantValues, StringComparer.OrdinalIgnoreCase);
 
         var utcNow = new DateTimeOffset(2026, 11, 1, 9, 0, 0, TimeSpan.Zero);
-        var expiresAt = utcNow.AddDays(7);
+        var refreshTokenDays = 7;
+        var expiresAt = utcNow.AddDays(refreshTokenDays);
 
         var appendOptions = RefreshCookieService.BuildAppendOptions(utcNow, expiresAt);
         Assert.True(appendOptions.HttpOnly);
         Assert.True(appendOptions.Secure);
         Assert.Equal(SameSiteMode.Lax, appendOptions.SameSite);
-        Assert.Equal("/api/auth", appendOptions.Path);
+        Assert.Equal("/", appendOptions.Path);
         Assert.Null(appendOptions.Domain);
-        Assert.Equal(TimeSpan.FromDays(7), appendOptions.MaxAge);
+        Assert.Equal(TimeSpan.FromDays(refreshTokenDays), appendOptions.MaxAge);
         Assert.Equal(expiresAt, appendOptions.Expires);
 
         var deleteOptions = RefreshCookieService.BuildDeleteOptions();
         Assert.True(deleteOptions.HttpOnly);
         Assert.True(deleteOptions.Secure);
         Assert.Equal(SameSiteMode.Lax, deleteOptions.SameSite);
-        Assert.Equal("/api/auth", deleteOptions.Path);
+        Assert.Equal(appendOptions.Path, deleteOptions.Path);
+        Assert.Equal("/", deleteOptions.Path);
         Assert.Null(deleteOptions.Domain);
+
+        // Verify actual Set-Cookie wire headers for both Append and Delete satisfy RFC 6265bis __Host- browser rules
+        var rawToken = TokenCryptoHelper.GenerateSecureRefreshToken();
+
+        var appendContext = new DefaultHttpContext();
+        RefreshCookieService.AppendRefreshCookie(appendContext, rawToken, utcNow, expiresAt);
+        var appendHeader = Assert.Single(appendContext.Response.Headers.SetCookie)!;
+        AssertValidBrowserHostRefreshSetCookieHeader(appendHeader, expectNonEmptyValue: true);
+        Assert.Contains("max-age=604800", appendHeader, StringComparison.OrdinalIgnoreCase);
+
+        var deleteContext = new DefaultHttpContext();
+        RefreshCookieService.DeleteRefreshCookie(deleteContext);
+        var deleteHeader = Assert.Single(deleteContext.Response.Headers.SetCookie)!;
+        AssertValidBrowserHostRefreshSetCookieHeader(deleteHeader, expectNonEmptyValue: false);
+    }
+
+    [Fact]
+    public void RefreshTokenReplayClassification_BeforeAndAtGraceWindowBoundary_ReturnsConcurrentLostRace_WhenReplacementIsActiveLeaf()
+    {
+        var graceWindow = RefreshTokenService.DefaultConcurrentRotationGraceWindow;
+        Assert.True(graceWindow > TimeSpan.Zero && graceWindow <= TimeSpan.FromSeconds(5));
+
+        var createdAt = new DateTimeOffset(2026, 11, 1, 9, 0, 0, TimeSpan.Zero);
+        var rotatedAt = createdAt.AddMinutes(15);
+        var tokenHash = TokenCryptoHelper.ComputeSha256Hex(TokenCryptoHelper.GenerateSecureRefreshToken());
+
+        var rotatedToken = RefreshToken.Create(
+            userId: Guid.NewGuid(),
+            tokenHash: tokenHash,
+            familyId: Guid.NewGuid(),
+            createdAt: createdAt,
+            expiresAt: createdAt.AddDays(7));
+        rotatedToken.MarkRotated(rotatedAt, Guid.NewGuid());
+
+        // 1. Thread timestamp captured slightly before winner persisted RotatedAt (-50ms)
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ConcurrentLostRace,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt.AddMilliseconds(-50),
+                graceWindow: graceWindow));
+
+        // 2. Exact rotation timestamp (+0ms)
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ConcurrentLostRace,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt,
+                graceWindow: graceWindow));
+
+        // 3. Inside grace window (1ms before boundary)
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ConcurrentLostRace,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt + graceWindow - TimeSpan.FromMilliseconds(1),
+                graceWindow: graceWindow));
+
+        // 4. Exact upper boundary of grace window
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ConcurrentLostRace,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt + graceWindow,
+                graceWindow: graceWindow));
+    }
+
+    [Fact]
+    public void RefreshTokenReplayClassification_AfterGraceWindowBoundary_OrWhenRevokedOrReplacementNotActiveLeaf_ReturnsReuseDetected()
+    {
+        var graceWindow = RefreshTokenService.DefaultConcurrentRotationGraceWindow;
+        var createdAt = new DateTimeOffset(2026, 11, 1, 9, 0, 0, TimeSpan.Zero);
+        var rotatedAt = createdAt.AddMinutes(15);
+        var tokenHash = TokenCryptoHelper.ComputeSha256Hex(TokenCryptoHelper.GenerateSecureRefreshToken());
+
+        var rotatedToken = RefreshToken.Create(
+            userId: Guid.NewGuid(),
+            tokenHash: tokenHash,
+            familyId: Guid.NewGuid(),
+            createdAt: createdAt,
+            expiresAt: createdAt.AddDays(7));
+        rotatedToken.MarkRotated(rotatedAt, Guid.NewGuid());
+
+        // 1. 1 tick after grace window upper boundary -> ReuseDetected
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ReuseDetected,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt + graceWindow + TimeSpan.FromTicks(1),
+                graceWindow: graceWindow));
+
+        // 2. 1ms after grace window upper boundary -> ReuseDetected
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ReuseDetected,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt + graceWindow + TimeSpan.FromMilliseconds(1),
+                graceWindow: graceWindow));
+
+        // 3. Within grace window, but replacement token B was ALREADY rotated to C (or revoked) -> ReuseDetected
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ReuseDetected,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: false,
+                utcNow: rotatedAt.AddMilliseconds(100),
+                graceWindow: graceWindow));
+
+        // 4. Within grace window, but token A itself was explicitly revoked -> ReuseDetected
+        rotatedToken.MarkRevoked(rotatedAt.AddMilliseconds(50), RefreshTokenRevokeReasons.Logout);
+        Assert.Equal(
+            RotatedTokenReplayDisposition.ReuseDetected,
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt.AddMilliseconds(100),
+                graceWindow: graceWindow));
+
+        // 5. Out-of-bounds graceWindow configuration is rejected
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt,
+                graceWindow: TimeSpan.FromSeconds(-1)));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            RefreshTokenService.ClassifyNonActiveTokenReplay(
+                rotatedToken,
+                replacementIsActiveLeaf: true,
+                utcNow: rotatedAt,
+                graceWindow: TimeSpan.FromSeconds(31)));
+    }
+
+    private static void AssertValidBrowserHostRefreshSetCookieHeader(string rawSetCookie, bool expectNonEmptyValue)
+    {
+        var segments = rawSetCookie.Split(';', StringSplitOptions.TrimEntries);
+        Assert.NotEmpty(segments);
+
+        var nameValue = segments[0];
+        var eqIndex = nameValue.IndexOf('=');
+        Assert.True(eqIndex > 0);
+
+        var cookieName = nameValue[..eqIndex];
+        var cookieValue = nameValue[(eqIndex + 1)..];
+
+        Assert.Equal(SecurityCookieConstants.RefreshCookieName, cookieName);
+        if (expectNonEmptyValue)
+        {
+            Assert.False(string.IsNullOrEmpty(cookieValue));
+        }
+        else
+        {
+            Assert.Equal(string.Empty, cookieValue);
+        }
+
+        var attributes = segments.Skip(1).ToArray();
+        Assert.Contains(attributes, a => a.Equals("path=/", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(attributes, a => a.StartsWith("path=/api", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("httponly", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("secure", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(attributes, a => a.Equals("samesite=lax", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(attributes, a => a.StartsWith("domain=", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

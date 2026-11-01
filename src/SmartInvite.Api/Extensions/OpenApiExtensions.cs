@@ -75,7 +75,7 @@ public static class OpenApiExtensions
 
         ### Quy trình thử nghiệm API trong Swagger UI (yêu cầu HTTPS hợp lệ)
         1. **Lấy CSRF token:** Gọi `GET /api/auth/csrf` để trình duyệt nhận cookie `__Host-SmartInvite.Antiforgery` và sao chép giá trị `data.requestToken`.
-        2. **Đăng nhập:** Gọi `POST /api/auth/login` với `email`, `password` (mật khẩu tài khoản SmartInvite, **không phải** mật khẩu Google/Gmail) và điền `requestToken` vào header `X-CSRF-TOKEN`. Phản hồi JSON trả về `data.accessToken` (JWT ngắn hạn) và trình duyệt nhận cookie `__Host-SmartInvite.Refresh` (`HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/api/auth`).
+        2. **Đăng nhập:** Gọi `POST /api/auth/login` với `email`, `password` (mật khẩu tài khoản SmartInvite, **không phải** mật khẩu Google/Gmail) và điền `requestToken` vào header `X-CSRF-TOKEN`. Phản hồi JSON trả về `data.accessToken` (JWT ngắn hạn) và trình duyệt nhận cookie `__Host-SmartInvite.Refresh` (`HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`).
         3. **Ủy quyền Bearer trong Swagger UI:** Nhấn nút **Authorize**, dán giá trị `data.accessToken` (không gõ thêm chữ `Bearer `) rồi xác nhận.
         4. **Gọi các API Bearer (không cần CSRF):** Gọi `GET /api/auth/me`, `POST /api/auth/logout-all`, hoặc các API quản trị `POST /api/admin/hosts`, `POST /api/admin/hosts/{hostId}/lock`, `POST /api/admin/hosts/{hostId}/unlock` (khi đăng nhập bằng tài khoản `ADMIN`).
         5. **Làm mới access token:** Khi JWT hết hạn, gọi `POST /api/auth/refresh` kèm header `X-CSRF-TOKEN` để xoay vòng refresh cookie và nhận `data.accessToken` mới.

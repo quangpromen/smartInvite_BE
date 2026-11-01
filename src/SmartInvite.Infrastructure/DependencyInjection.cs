@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SmartInvite.Application.Abstractions;
 using SmartInvite.Application.AdminHosts;
@@ -95,10 +96,23 @@ public static class DependencyInjection
         services.AddSingleton<IRefreshTokenExecutionSeam, DefaultRefreshTokenExecutionSeam>();
         services.AddSingleton<IAccessTokenService, JwtAccessTokenService>();
         services.AddScoped<IAccessTokenStateValidator, AccessTokenStateValidator>();
-        services.AddScoped<IRefreshTokenService, RefreshTokenService>();
+        services.AddScoped<IRefreshTokenService>(sp => new RefreshTokenService(
+            sp.GetRequiredService<ApplicationDbContext>(),
+            sp.GetRequiredService<UserManager<ApplicationUser>>(),
+            sp.GetRequiredService<IAccessTokenService>(),
+            sp.GetRequiredService<IOptions<JwtOptions>>(),
+            sp.GetRequiredService<IRefreshTokenExecutionSeam>(),
+            sp.GetRequiredService<ILogger<RefreshTokenService>>()));
         services.AddScoped<ICurrentUser, CurrentUser>();
         services.AddScoped<IAuthSessionService, AuthSessionService>();
-        services.AddScoped<IAdminHostService, AdminHostService>();
+        services.AddScoped<IAdminHostService>(sp => new AdminHostService(
+            sp.GetRequiredService<ApplicationDbContext>(),
+            sp.GetRequiredService<UserManager<ApplicationUser>>(),
+            sp.GetRequiredService<RoleManager<IdentityRole<Guid>>>(),
+            sp.GetRequiredService<ICurrentUser>(),
+            sp.GetRequiredService<IDateTimeProvider>(),
+            sp.GetRequiredService<IAdminHostExecutionSeam>(),
+            sp.GetRequiredService<ILogger<AdminHostService>>()));
         services.AddScoped<AdminBootstrapService>();
         services.AddHostedService<AdminBootstrapHostedService>();
 

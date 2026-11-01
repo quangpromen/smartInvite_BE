@@ -19,9 +19,18 @@ internal sealed class DefaultRefreshTokenExecutionSeam : IRefreshTokenExecutionS
         Task.CompletedTask;
 }
 
+internal enum RotatedTokenReplayDisposition
+{
+    ConcurrentLostRace = 0,
+    ReuseDetected = 1
+}
+
 public sealed class RefreshTokenService : IRefreshTokenService
 {
     private const int MaxRawRefreshTokenLength = 512;
+
+    internal static readonly TimeSpan DefaultConcurrentRotationGraceWindow = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MaxAllowedConcurrentRotationGraceWindow = TimeSpan.FromSeconds(30);
 
     private static readonly Error GenericInvalidRefreshTokenError = Error.Unauthorized(
         ErrorCodes.InvalidRefreshToken,
@@ -33,6 +42,7 @@ public sealed class RefreshTokenService : IRefreshTokenService
     private readonly IOptions<JwtOptions> _jwtOptions;
     private readonly IRefreshTokenExecutionSeam _executionSeam;
     private readonly ILogger<RefreshTokenService> _logger;
+    private readonly TimeSpan _concurrentRotationGraceWindow;
 
     public RefreshTokenService(
         ApplicationDbContext dbContext,
@@ -46,7 +56,8 @@ public sealed class RefreshTokenService : IRefreshTokenService
             accessTokenService,
             jwtOptions,
             new DefaultRefreshTokenExecutionSeam(),
-            logger)
+            logger,
+            DefaultConcurrentRotationGraceWindow)
     {
     }
 
@@ -56,14 +67,54 @@ public sealed class RefreshTokenService : IRefreshTokenService
         IAccessTokenService accessTokenService,
         IOptions<JwtOptions> jwtOptions,
         IRefreshTokenExecutionSeam executionSeam,
-        ILogger<RefreshTokenService> logger)
+        ILogger<RefreshTokenService> logger,
+        TimeSpan? concurrentRotationGraceWindow = null)
     {
+        var resolvedGraceWindow = concurrentRotationGraceWindow ?? DefaultConcurrentRotationGraceWindow;
+        if (resolvedGraceWindow < TimeSpan.Zero || resolvedGraceWindow > MaxAllowedConcurrentRotationGraceWindow)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(concurrentRotationGraceWindow),
+                "Grace window xử lý đồng thời refresh token phải nằm trong khoảng từ 0 đến 30 giây.");
+        }
+
         _dbContext = dbContext;
         _userManager = userManager;
         _accessTokenService = accessTokenService;
         _jwtOptions = jwtOptions;
         _executionSeam = executionSeam;
         _logger = logger;
+        _concurrentRotationGraceWindow = resolvedGraceWindow;
+    }
+
+    internal static RotatedTokenReplayDisposition ClassifyNonActiveTokenReplay(
+        RefreshToken existingToken,
+        bool replacementIsActiveLeaf,
+        DateTimeOffset utcNow,
+        TimeSpan graceWindow)
+    {
+        ArgumentNullException.ThrowIfNull(existingToken);
+
+        if (graceWindow < TimeSpan.Zero || graceWindow > MaxAllowedConcurrentRotationGraceWindow)
+        {
+            throw new ArgumentOutOfRangeException(nameof(graceWindow));
+        }
+
+        if (existingToken.IsRevoked ||
+            existingToken.RotatedAt is not DateTimeOffset rotatedAt ||
+            existingToken.ReplacedByTokenId is null ||
+            !replacementIsActiveLeaf)
+        {
+            return RotatedTokenReplayDisposition.ReuseDetected;
+        }
+
+        var elapsedSinceRotation = utcNow - rotatedAt;
+        if (elapsedSinceRotation >= -graceWindow && elapsedSinceRotation <= graceWindow)
+        {
+            return RotatedTokenReplayDisposition.ConcurrentLostRace;
+        }
+
+        return RotatedTokenReplayDisposition.ReuseDetected;
     }
 
     public async Task<IssuedRefreshTokenResult> IssueAsync(
@@ -129,6 +180,38 @@ public sealed class RefreshTokenService : IRefreshTokenService
 
             if (existingToken.IsRotated || existingToken.IsRevoked)
             {
+                var replacementIsActiveLeaf =
+                    !existingToken.IsRevoked &&
+                    existingToken.ReplacedByTokenId is Guid replacedByTokenId &&
+                    await _dbContext.RefreshTokens
+                        .AsNoTracking()
+                        .AnyAsync(
+                            t => t.Id == replacedByTokenId &&
+                                 t.FamilyId == existingToken.FamilyId &&
+                                 t.RotatedAt == null &&
+                                 t.RevokedAt == null &&
+                                 t.ExpiresAt > utcNow,
+                            cancellationToken);
+
+                var disposition = ClassifyNonActiveTokenReplay(
+                    existingToken,
+                    replacementIsActiveLeaf,
+                    utcNow,
+                    _concurrentRotationGraceWindow);
+
+                if (disposition == RotatedTokenReplayDisposition.ConcurrentLostRace)
+                {
+                    await transaction.RollbackAsync(cancellationToken);
+
+                    _logger.LogWarning(
+                        "Concurrent refresh token rotation lost race within grace window. UserId: {UserId}, FamilyId: {FamilyId}, TokenId: {TokenId}",
+                        existingToken.UserId,
+                        existingToken.FamilyId,
+                        existingToken.Id);
+
+                    return Result.Failure<RotatedRefreshSession>(GenericInvalidRefreshTokenError);
+                }
+
                 var revokedCount = await _dbContext.RefreshTokens
                     .Where(t => t.FamilyId == existingToken.FamilyId && t.RevokedAt == null)
                     .ExecuteUpdateAsync(
